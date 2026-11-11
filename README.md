@@ -15,11 +15,59 @@ deviates, and circuit breakers reject stale, wild, or jumping prints.
 > [PROTOCOL.md](PROTOCOL.md) for the exact rules and [VC_SUMMARY.md](VC_SUMMARY.md)
 > for the executive summary.
 
+**Live demo (paper mode, no wallet or funds needed): https://blasrodri.github.io/zerotick/**
+
+Built for NEAR HACKATHON — tracks: `defi` (shared-vault synthetic trading,
+liquidity-protected pricing) and `realworld` (emerging-market FX/index access
+that has no clean on-chain venue). NEAR-specific pieces: `env::ed25519_verify`
+oracle bundles re-derived at execution (zero quote transactions), NEP-141
+`ft_transfer_call` funding, `claim()` payouts with failure-restore callbacks,
+and near-sdk wasm contracts.
+
+## Try it in 2 minutes (judge walkthrough)
+
+Hosted demo — do this, see that:
+
+1. Open https://blasrodri.github.io/zerotick/ → see 62 markets (FX, indexes,
+   stocks, events), USD/ARS chart, paper banner. Header reads
+   `CASH $10,000 · POSITIONS $0.00 · POOL $0.00`.
+2. Click **▲ BUY USD/ARS** (default $250) → Cash becomes $9,750, a position
+   row appears under the chart (`spent $250 @ 1,4xx · now …`), and its
+   PnL in the header moves every ~3 seconds.
+3. Click that position row → Sell is pre-selected; press **MAX**, then
+   **▼ Sell** → position closes, Cash increases by the payout
+   ($250 ± spread/price move), trade appears under "Recent trades".
+4. Open the **Earn** tab → **Deposit $500** → "Yours is worth $500",
+   pool cash rises by $500; **Withdraw $500** → both revert. This pool is
+   the counterparty that paid your trade in step 3.
+5. Pick a Sports/Events market (e.g. FEDCUT) → see the YES/NO resolution
+   card; your positions panel stays put regardless of market type.
+
+Full on-chain proof (real token custody, not paper) — run locally:
+
+```bash
+./run-local.sh
+```
+
+Do that → see the sandbox deploy print `✓` for LP deposit via
+`ft_transfer_call`, refunded underpaid/forged trades, 0%-allocation gating,
+buy/sell/claim with a separate trader account, binary 0.62-fixing rejection,
+settlement + claim, non-owner admin rejections, ending with
+`DONE on-chain … failures=0`. The same flow runs in CI (`.github/workflows/ci.yml`,
+`sandbox` job).
+
+Verify everything else:
+
+```bash
+cargo test        # 63 tests: core, 10 review regressions, invariants/permissions/PnL
+cargo run         # worked pricing example (staleness widens the spread)
+```
+
 ## Layout
 
 | Path | What |
 |---|---|
-| `src/protocol.rs` | Canonical Rust core: shared vault, formulas, pricing, settlement (53 unit tests workspace-wide) |
+| `src/protocol.rs` | Canonical Rust core: shared vault, formulas, pricing, settlement (63 tests incl. `tests/invariants.rs`) |
 | `src/{pricing,market,functions}.rs` | Earlier prototypes, kept for reference only — do not build on them |
 | `contracts/zerotick/` | NEAR contract: ed25519 bundle verification + real NEP-141 custody (`ft_transfer_call` in, `claim()` out) |
 | `contracts/mock-usdc/` | **Test-only** mintable NEP-141 token for sandbox proofs. Never a real asset |
@@ -48,7 +96,7 @@ and `claim()` payouts.
 ## Core demo & tests (no Docker)
 
 ```bash
-cargo test            # protocol + regression tests
+cargo test            # 63 tests: core + regressions + invariants/permissions/PnL
 cargo run             # worked pricing/vault example
 cargo build --target wasm32-unknown-unknown --release -p zerotick-contract -p mock-usdc
 ```

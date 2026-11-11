@@ -1,0 +1,40 @@
+name: Deploy demo to GitHub Pages
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build (paper demo — no wallet or funds needed)
+        working-directory: frontend
+        env:
+          PAGES_BASE: /zerotick/
+          VITE_CONTRACT_ID: zerotick.testnet
+          VITE_NEAR_RPC: https://rpc.testnet.near.org
+          VITE_NETWORK_ID: testnet
+        run: |
+          npm ci --legacy-peer-deps
+          npm run build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+      - id: deploy
+        uses: actions/deploy-pages@v4
