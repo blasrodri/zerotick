@@ -1,0 +1,31 @@
+[package]
+name = "zerotick"
+version = "0.1.0"
+edition = "2024"
+description = "ZeroTick — permissionless synthetic market factory (executable pricing policy core)"
+license = "MIT"
+
+[workspace]
+members = ["contracts/zerotick", "contracts/mock-usdc"]
+exclude = ["frontend"]
+
+# Workspace-root profile: per-package profiles are ignored by Cargo.
+# overflow-checks stay on in release — a wrap must trap, never corrupt funds.
+[profile.release]
+lto = true
+opt-level = "s"
+panic = "abort"
+overflow-checks = true
+
+[lib]
+name = "zerotick"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zerotick"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+borsh = { version = "1.0", features = ["derive"] }

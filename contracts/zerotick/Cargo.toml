@@ -1,0 +1,19 @@
+[package]
+name = "zerotick-contract"
+version = "0.1.0"
+edition = "2024"
+description = "ZeroTick NEAR contract — shared USDC vault, signed oracle bundles, NEP-141 custody"
+license = "MIT"
+
+[lib]
+name = "zerotick_contract"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+zerotick = { path = "../..", package = "zerotick" }
+near-sdk = "5.19.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+borsh = { version = "1.0", features = ["derive"] }
+

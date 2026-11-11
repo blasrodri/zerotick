@@ -1,0 +1,10 @@
+/target
+**/node_modules
+frontend/dist
+frontend/.env
+.venv
+.DS_Store
+*.log
+.env
+*-key.json
+oracle-service/.env

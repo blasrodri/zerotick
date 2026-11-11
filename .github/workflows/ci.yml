@@ -1,0 +1,72 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (core, host)
+        run: cargo clippy -p zerotick --all-targets -- -D warnings
+      - name: Clippy (contracts, wasm)
+        run: cargo clippy --target wasm32-unknown-unknown -p zerotick-contract -p mock-usdc -- -D warnings
+      - name: Tests
+        run: cargo test -p zerotick
+      - name: Wasm contracts
+        run: cargo build --target wasm32-unknown-unknown --release -p zerotick-contract -p mock-usdc
+      - name: Cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install (locked)
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+      # EX-2026-01 (see SECURITY-EXCEPTIONS.md, expires 2027-02-01):
+      # gate on critical, always print the full report.
+      - name: NPM audit
+        working-directory: frontend
+        run: |
+          npm audit || true
+          npm audit --audit-level=critical
+  sandbox:
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Toolchain + wasm
+        run: |
+          rustup show
+          cargo build --target wasm32-unknown-unknown --release -p zerotick-contract -p mock-usdc
+      - name: NEAR sandbox
+        run: |
+          docker run -d --name zerotick-near -p 3030:3030 nearprotocol/sandbox:2.13.4
+          for i in $(seq 1 40); do curl -s http://127.0.0.1:3030/status >/dev/null && break; sleep 1; done
+          curl -s http://127.0.0.1:3030/status >/dev/null
+      - name: On-chain custody proof
+        working-directory: frontend
+        run: |
+          npm ci --legacy-peer-deps
+          TS=$(date +%s)
+          CONTRACT_ID="zt${TS}.sandbox" USDC_ID="usdc${TS}.sandbox" TRADER_ID="tr${TS}.sandbox" node deploy-local-v2.mjs

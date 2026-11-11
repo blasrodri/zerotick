@@ -1,0 +1,14 @@
+{
+  "name": "zerotick-oracle-service",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ZeroTick oracle signer service (operator-run; see custody notes in oracle-service.mjs)",
+  "license": "MIT",
+  "scripts": {
+    "start": "node oracle-service.mjs"
+  },
+  "dependencies": {
+    "near-api-js": "^4.0.0"
+  }
+}
