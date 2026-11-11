@@ -140,9 +140,9 @@ function quote(m, spotLevel, ageSecs, devBps, pol, poolUtil = 0) {
   const baseBps = pol?.base_spread_bps ?? FORMULA.baseBps;
   const skewCap = pol?.inventory_skew_bps ?? FORMULA.skewBps;
   const fair = m.base * Math.min(FORMULA.cap, Math.max(0, spotLevel / m.inception));
-  const liability = m.minted * fair;
-  // Liquidity charge: whichever is tighter — this market or the whole pool.
-  const x = Math.min(1, Math.max(liability / (FORMULA.cap * 10000), poolUtil || 0));
+  // Liquidity charge (paper): pool utilization only. Seed `minted` numbers
+  // are display fluff and must not invent a charge on an empty pool.
+  const x = Math.min(1, Math.max(0, poolUtil || 0));
   const stale = FORMULA.staleBpsPerSec * Math.max(0, ageSecs);
   const vol = devBps / FORMULA.volDivisor;
   const half = baseBps + stale + vol;
@@ -242,7 +242,11 @@ export default function App() {
       ]);
       setChain({ vault, position, claimable, err: null, who });
     } catch (e) {
-      setChain({ vault: null, position: '—', claimable: '—', err: String(e?.message || e), who: account || CONFIG.contractId });
+      const raw = String(e?.message || e);
+      const err = /UNKNOWN_ACCOUNT|does not exist/i.test(raw)
+        ? `No contract deployed at ${CONFIG.contractId} on ${CONFIG.networkId} yet — this demo is paper-only. Run ./run-local.sh for the on-chain flow.`
+        : raw;
+      setChain({ vault: null, position: '—', claimable: '—', err, who: account || CONFIG.contractId });
     }
   };
   useEffect(() => {
@@ -632,7 +636,7 @@ export default function App() {
           <div className="holdings">
             <div className="card-title">On-chain · {CONFIG.networkId}</div>
             {chain?.err
-              ? <div className="hint">RPC unreachable: {chain.err}. Paper numbers above are unaffected and simulated.</div>
+              ? <div className="hint">{chain.err} Paper numbers are simulated locally.</div>
               : chain?.vault
                 ? <>
                     <div className="kv"><span>Vault collateral</span><b>{fmt$((Number(chain.vault.collateral) || 0) / 1e6, 0)}</b></div>
