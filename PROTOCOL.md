@@ -17,9 +17,9 @@ and no liquidation.
 
 | Kind | Fair | Expiry / payout |
 |---|---|---|
-| `SyntheticSpotV1` | `base × spot/inception` | Never expires. Exit = sell. Cash payout capped at the lot's reserved max (2× stress reserve) |
-| `IndexCappedV1` | `base × min(2, spot/inception)` | Fixed tenor (default 7d); payoff = capped fair at fixing |
-| `DirectV1` | `spot` (already USDC minor) | Like IndexCapped for reserve purposes |
+| `SyntheticSpotV1` | `base × spot/inception` | Perpetual. Exit = sell. Cash payout capped at the lot's reserved max (2× stress reserve) |
+| `IndexCappedV1` | `base × min(2, spot/inception)` | Perpetual lot; settles only if the market itself matures (payoff = capped fair at fixing) |
+| `DirectV1` | `spot` (already USDC minor) | Perpetual, like SyntheticSpot |
 | `BinaryV1` | `payout × p`, `p ∈ [0,1]` | Settles at maturity; fixing must be exactly `1` (pay `base`) or `0` (pay 0) |
 
 Formulas are validated at creation (`Formula::validate`): positive base,
@@ -73,7 +73,14 @@ signed over canonical bytes
 half_spread_bps = base_spread + staleness_bps_per_sec × age_secs
                 + deviation_bps_1m / vol_divisor + tenor_charge
 ask = fair × (1 + half_spread + skew×x)   bid = fair × (1 − half_spread + skew×x)
-x   = market liability at fair / per-market reserve cap   (0..1)
+x   = max(this market's reserve usage, whole pool's reserved/collateral)   (0..1)
+
+Liquidity protection: a healthy pool (low utilization) quotes the pure
+formula price. As utilization rises, skew shifts prices against new risk
+(buys dearer, sells better) by up to the formula's full skew, and hard
+reserve/allocation caps reject beyond that. The formula changes to protect
+the pool only as health deteriorates — it is one continuous rule, not a
+mode switch.
 ```
 
 Best price requires data ≲1s old; hard reject past `max_age_secs` (10s).
@@ -100,10 +107,13 @@ Best price requires data ≲1s old; hard reject past `max_age_secs` (10s).
   last, `observed_at ∈ [expiry, expiry + 24h]`, not from the future.
   Binary fixings must be exactly `0` or `1` — a trading probability can
   never settle a market.
-- `settle_market` closes every expired lot in pages, credits claimable per
-  holder, clears redemption requests, and halts the market on the last page.
-  `request_redemption` lets holders pre-register; `redeem` settles one
-  holder directly. Synthetic spot never settles.
+- `settle_market` closes every settleable lot in pages, credits claimable
+  per holder, clears redemption requests, and halts the market on the last
+  page. `request_redemption` lets holders pre-register; `redeem` settles
+  one holder directly. Perpetual lots (FX/index/direct) settle only if
+  their market itself matures — otherwise exit is always sell-at-bid.
+  An explicit fixed-tenor lot (`buy_with_duration`) still expires on its
+  own schedule.
 
 ## Why zero quote txs
 

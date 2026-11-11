@@ -648,11 +648,9 @@ impl SharedVault {
                 next_withdrawal_at_ms: self.next_withdrawal_at_ms,
             });
         }
-        if self
-            .position_lots
-            .values()
-            .any(|lot| lot.status == PositionStatus::Open && lot.expires_at_ms <= now_ms)
-        {
+        if self.position_lots.values().any(|lot| {
+            lot.status == PositionStatus::Open && self.effective_expiry_ms(lot) <= now_ms
+        }) {
             return Err(ExecError::UnsettledExpiredPositions);
         }
         let held = *self.lp_shares.get(&who.0).unwrap_or(&0);
@@ -912,11 +910,22 @@ impl SharedVault {
             .get(&bundle.market.0)
             .ok_or(ExecError::MarketNotEnabled)?;
         let fair = m.formula.fair(bundle.spot);
+        // Liquidity protection: skew keys off whichever is tighter — this
+        // market's reserve usage or the whole pool's. Healthy pool (low
+        // utilization) => pure formula price; as the pool fills, prices
+        // shift by up to the formula's full skew before hard caps reject.
+        let capacity = m.formula.max_market_reserved_usdc_minor;
+        let pool_util = if self.collateral_usdc_minor == 0 {
+            1.0
+        } else {
+            (self.total_reserved() as f64 / self.collateral_usdc_minor as f64).clamp(0.0, 1.0)
+        };
+        let exposure = m.liability(fair).max((pool_util * capacity as f64) as u64);
         Ok(price_with_duration(
             &m.formula,
             bundle,
-            m.liability(fair),
-            m.formula.max_market_reserved_usdc_minor,
+            exposure,
+            capacity,
             now_ms,
             duration_secs,
         ))
@@ -955,14 +964,27 @@ impl SharedVault {
                 }
                 remaining
             }
-            FormulaKind::SyntheticSpotV1 if duration_secs.is_none() => 0,
-            _ => duration_secs.unwrap_or(7 * 86_400),
+            // Perpetual by default: FX/index/direct lots never expire and
+            // exit by selling. Only binary (prediction) lots end, at the
+            // event. An explicit duration still creates a fixed-tenor lot.
+            _ if duration_secs.is_none() => 0,
+            _ => duration_secs.unwrap(),
         };
         if duration < 0 {
             return Err(ExecError::InvalidDuration);
         }
         let expires_at_ms = if duration == 0 {
-            i64::MAX
+            // Perpetual lot: lives until sold, or until the market itself
+            // matures (finite maturity acts as the market's end date).
+            if market.formula.maturity_unix_secs == i64::MAX {
+                i64::MAX
+            } else {
+                market
+                    .formula
+                    .maturity_unix_secs
+                    .checked_mul(1000)
+                    .ok_or(ExecError::AmountOverflow)?
+            }
         } else if matches!(market.formula.kind, FormulaKind::BinaryV1) {
             // Binary lots expire exactly at the event maturity; adding the
             // whole-second remaining duration to a sub-second `now_ms` would
@@ -1385,6 +1407,18 @@ impl SharedVault {
         Ok(())
     }
 
+    /// A lot becomes settleable at its own expiry or at market maturity,
+    /// whichever comes first (perpetual lots settle only if/when their
+    /// market itself matures).
+    fn effective_expiry_ms(&self, lot: &PositionLot) -> i64 {
+        match self.markets.get(&lot.market.0) {
+            Some(m) if m.formula.maturity_unix_secs != i64::MAX => lot
+                .expires_at_ms
+                .min(m.formula.maturity_unix_secs.saturating_mul(1000)),
+            _ => lot.expires_at_ms,
+        }
+    }
+
     /// Settle one expired lot from an authenticated fixing bundle. The
     /// bundle may be submitted after expiry; trading max-age does not apply.
     pub fn settle_position(
@@ -1408,10 +1442,11 @@ impl SharedVault {
         if lot.status != PositionStatus::Open {
             return Err(ExecError::PositionNotFound);
         }
-        if now_ms < lot.expires_at_ms {
+        let eff_expiry = self.effective_expiry_ms(&lot);
+        if now_ms < eff_expiry {
             return Err(ExecError::PositionNotExpired);
         }
-        self.validate_settlement_bundle(bundle, lot.expires_at_ms, now_ms)?;
+        self.validate_settlement_bundle(bundle, eff_expiry, now_ms)?;
         let (pay_per, last_fair) = {
             let market = self.markets.get(&lot.market.0).unwrap();
             (
@@ -1459,7 +1494,7 @@ impl SharedVault {
                 lot.status == PositionStatus::Open
                     && lot.account == *holder
                     && lot.market == bundle.market
-                    && lot.expires_at_ms <= now_ms
+                    && self.effective_expiry_ms(lot) <= now_ms
             })
             .map(|lot| lot.id)
             .collect();
@@ -1609,7 +1644,7 @@ impl SharedVault {
             .filter(|lot| {
                 lot.status == PositionStatus::Open
                     && lot.market == bundle.market
-                    && lot.expires_at_ms <= now_ms
+                    && self.effective_expiry_ms(lot) <= now_ms
             })
             .map(|lot| (lot.id, lot.account.clone()))
             .collect();

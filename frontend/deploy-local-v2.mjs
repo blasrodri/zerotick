@@ -187,6 +187,26 @@ await call('claim', {}, '0');
 await sleep(2000);
 check((await view('claimable_of', { account: CONTRACT_ID })) === '0', 'LP withdrawal claimed');
 
+console.log('\n-- permission negatives (trader is not the owner) --');
+const mustFailCall = async (label, fn) => {
+  try { await fn(); check(false, label); } catch { check(true, label); }
+};
+await mustFailCall('non-owner set_market_allocation rejected', () => tcall('set_market_allocation', { market_id: 'USDARS', allocation_bps: 1 }));
+await mustFailCall('non-owner halt rejected', () => tcall('halt', { market_id: 'USDARS' }));
+await mustFailCall('non-owner rotate_oracle rejected', () => tcall('rotate_oracle', { market_id: 'USDARS', oracle_signer: 'mallory.near', oracle_pubkey: pubkey }));
+await mustFailCall('non-owner transfer_ownership rejected', () => tcall('transfer_ownership', { new_owner: TRADER_ID }));
+await mustFailCall('withdraw_lp with no shares rejected', () => tcall('withdraw_lp', { shares: '1000000' }));
+await mustFailCall('claim with zero claimable rejected', () => tcall('claim', {}));
+// Halt actually stops trading (buy refunded), unhalt restores quotes.
+await call('halt', { market_id: 'USDARS' });
+const heldHalt = await view('position_of', { account: TRADER_ID, market_id: 'USDARS' });
+await ftCallTrader(10_000_000n, { action: 'buy', market_id: 'USDARS', max_price_usdc_minor: '999999999', ...bundle('USDARS', 1500, 40, 200) });
+await sleep(1500);
+check((await view('position_of', { account: TRADER_ID, market_id: 'USDARS' })) === heldHalt, 'halted market refuses buys (refunded)');
+await mustFailCall('non-owner unhalt rejected', () => tcall('unhalt', { market_id: 'USDARS' }));
+await call('unhalt', { market_id: 'USDARS' });
+check((await view('quote', { market_id: 'USDARS', ...bundle('USDARS', 1500, 40, 200) })).includes('fair'), 'unhalt restores quoting');
+
 console.log('vault after:', await view('vault_state', {}));
 console.log(`\nDONE on-chain · contract=${CONTRACT_ID} · usdc(mock)=${USDC_ID} · rpc=${RPC} · failures=${failures}`);
 if (failures > 0) process.exitCode = 1;

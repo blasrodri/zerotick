@@ -132,16 +132,17 @@ function genMarkets() {
   return out;
 }
 const INITIAL = genMarkets();
-const VAULT_LP = 5_900_000; // shared-vault LP capital on top of per-market sale proceeds (display aggregate below)
+// (pool capital is live paper state below, seeded by POOL_SEED)
 
 /* formula IndexCappedV1 — mirrors src/protocol.rs */
 const FORMULA = { baseBps: 50, skewBps: 150, staleBpsPerSec: 25, volDivisor: 2, maxAge: 10, cap: 2 };
-function quote(m, spotLevel, ageSecs, devBps, pol) {
+function quote(m, spotLevel, ageSecs, devBps, pol, poolUtil = 0) {
   const baseBps = pol?.base_spread_bps ?? FORMULA.baseBps;
   const skewCap = pol?.inventory_skew_bps ?? FORMULA.skewBps;
   const fair = m.base * Math.min(FORMULA.cap, Math.max(0, spotLevel / m.inception));
   const liability = m.minted * fair;
-  const x = Math.min(1, liability / (FORMULA.cap * 10000));
+  // Liquidity charge: whichever is tighter — this market or the whole pool.
+  const x = Math.min(1, Math.max(liability / (FORMULA.cap * 10000), poolUtil || 0));
   const stale = FORMULA.staleBpsPerSec * Math.max(0, ageSecs);
   const vol = devBps / FORMULA.volDivisor;
   const half = baseBps + stale + vol;
@@ -157,6 +158,17 @@ const fmtK = (v) => v >= 1e6 ? '$' + (v / 1e6).toFixed(2) + 'M' : v >= 1000 ? '$
 const spotOf = (m) => m.inception * (m.price / m.base);
 const fmtFx = (v) => v >= 1000 ? v.toLocaleString(undefined, { maximumFractionDigits: 1 }) : v >= 10 ? v.toFixed(2) : v >= 1 ? v.toFixed(4) : v.toFixed(5);
 
+const PAPER_KEY = 'zerotick-paper-v2';
+function loadPaper() {
+  try {
+    const v2 = JSON.parse(localStorage.getItem(PAPER_KEY) || 'null');
+    if (v2) return v2;
+    const v1 = JSON.parse(localStorage.getItem('zerotick-paper-v1') || 'null') || {};
+    return { balance: v1.balance, holdings: v1.holdings, cost: v1.cost };
+  } catch { return {}; }
+}
+const POOL_SEED = 100_000; // other LPs' paper capital; the pool backs YOUR paper trades
+
 export default function App() {
   const [markets, setMarkets] = useState(INITIAL);
   const [selId, setSelId] = useState(INITIAL[0].id);
@@ -167,8 +179,16 @@ export default function App() {
   const [highlight, setHighlight] = useState(0);
   const [buy, setBuy] = useState(true);
   const [size, setSize] = useState('250');
-  const [balance, setBalance] = useState(10000);
-  const [holdings, setHoldings] = useState({});
+  const [balance, setBalance] = useState(() => loadPaper().balance ?? 10000);
+  const [holdings, setHoldings] = useState(() => loadPaper().holdings || {});
+  const [cost, setCost] = useState(() => loadPaper().cost || {}); // USDC cost basis per market
+  const [lp, setLp] = useState(() => loadPaper().lp || { deposited: 0, shares: 0 });
+  const [poolCash, setPoolCash] = useState(() => loadPaper().poolCash ?? POOL_SEED);
+  const [poolShares, setPoolShares] = useState(() => loadPaper().poolShares ?? POOL_SEED);
+  const [poolAmt, setPoolAmt] = useState('500');
+  const [tab, setTab] = useState('trade'); // 'trade' | 'earn' — separate screens, separate PnL
+  const [poolMode, setPoolMode] = useState('deposit'); // Earn screen action toggle
+  const saveWarned = useRef(false);
   const [fills, setFills] = useState([]);
   const [toast, setToast] = useState(null);
   const [account, setAccount] = useState('');
@@ -176,7 +196,6 @@ export default function App() {
   const [selector, setSelector] = useState(null);
   const [modal, setModal] = useState(null);
   const [hoverCandle, setHoverCandle] = useState(null);
-  const [simRet, setSimRet] = useState(30);
   const [showAdv, setShowAdv] = useState(false);
   const [pol, setPol] = useState({ base_spread_bps: 50, inventory_skew_bps: 150 });
   const [busy, setBusy] = useState(false);
@@ -194,7 +213,11 @@ export default function App() {
   const spot = useMemo(() => sel.inception * (sel.price / sel.base), [sel]);
   const spotCandles = useMemo(() => sel.candles.map(c => { const k = sel.inception / sel.base; return { o: c.o * k, h: c.h * k, l: c.l * k, c: c.c * k, v: c.v }; }), [sel]);
   const fxK = sel.inception / sel.base;
-  const q = useMemo(() => quote(sel, spot, ageSecs, sel.dev, pol), [sel, spot, ageSecs, pol]);
+  const poolUtilNow = poolCash > 0 ? Math.min(1, Object.entries(holdings).reduce((s2, [id, u]) => {
+    const m = markets.find(x => x.id === id);
+    return s2 + (m ? u * m.base * FORMULA.cap : 0);
+  }, 0) / poolCash) : 1;
+  const q = useMemo(() => quote(sel, spot, ageSecs, sel.dev, pol, poolUtilNow), [sel, spot, ageSecs, pol, poolUtilNow]);
 
   // wallet (dynamic import — never blocks first render)
   useEffect(() => {
@@ -240,15 +263,14 @@ export default function App() {
   // live clock for oracle age (price visibly worsens between bundles)
   useEffect(() => { const id = setInterval(() => setNowTick(Date.now()), 100); return () => clearInterval(id); }, []);
 
-  // oracle bundles arrive ~every 2.8s: age resets, selected market ticks
+  // oracle bundles arrive ~every 2.8s: age resets, EVERY market ticks so
+  // held positions/PnL move no matter which market is selected
   useEffect(() => {
     const id = setInterval(() => {
       setObservedAt(Date.now());
       setSeq(s => s + 1);
       setMarkets(prev => prev.map(m => {
-        const hot = m.id === selId || Math.random() > 0.9;
-        if (!hot) return m;
-        const drift = (Math.random() - 0.44) * 0.012;
+        const drift = (Math.random() - 0.47) * 0.006;
         const np = Math.max(0.5, +(m.price * (1 + drift)).toFixed(2));
         const candles = [...m.candles];
         const last = { ...candles[candles.length - 1] };
@@ -288,8 +310,12 @@ export default function App() {
     return () => window.removeEventListener('keydown', h);
   }, [focused, filtered, highlight]);
 
-  const vaultColl = useMemo(() => VAULT_LP + markets.reduce((s, m) => s + m.minted * m.price * 0.4, 0), [markets]);
-  const totalReserved = useMemo(() => markets.reduce((s, m) => s + m.minted * m.base * FORMULA.cap, 0), [markets]);
+  const vaultColl = poolCash;
+  const totalReserved = Object.entries(holdings).reduce((s2, [id, u]) => {
+    const m = markets.find(x => x.id === id);
+    return s2 + (m ? u * m.base * FORMULA.cap : 0);
+  }, 0);
+  const poolNavOf = (liab) => Math.max(0, poolCash - liab);
   const totalMtm = useMemo(() => markets.reduce((s, m) => s + m.minted * m.price, 0), [markets]);
   const coverage = totalReserved ? vaultColl / totalReserved : 99;
   const totalVol = useMemo(() => markets.reduce((s, m) => s + m.vol24, 0), [markets]);
@@ -305,10 +331,30 @@ export default function App() {
   const myBal = holdings[sel.id] || 0;
   const canSell = !buy && myBal >= receive - 1e-9;
   const tooOld = ageSecs > FORMULA.maxAge;
-  const simPayout = sel.base * Math.min(FORMULA.cap, Math.max(0, 1 + simRet / 100));
-  const simPnl = receive * simPayout - amt;
 
   const flash = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2600); };
+  useEffect(() => {
+    try { localStorage.setItem(PAPER_KEY, JSON.stringify({ balance, holdings, cost, lp, poolCash, poolShares })); }
+    catch { if (!saveWarned.current) { saveWarned.current = true; flash('Could not save paper positions in this browser — they will reset on refresh'); } }
+  }, [balance, holdings, cost, lp, poolCash, poolShares]);
+
+  // positions marked at EXIT value: what a sell pays now (bid, capped $20/unit)
+  const exitValue = (m, units) => Math.min(units * quote(m, spotOf(m), ageSecs, m.dev, pol, poolUtilNow).bid, units * m.base * FORMULA.cap);
+  const posRows = Object.entries(holdings).filter(([, v]) => v > 0.001).map(([id, units]) => {
+    const m = markets.find(x => x.id === id);
+    const spent = cost[id] || 0;
+    const value = m ? exitValue(m, units) : 0;
+    const avg = units ? spent / units : 0;
+    return { id, m, units, spent, avg, now: m?.price || 0, entryLevel: m ? m.inception * (avg / m.base) : 0, nowLevel: m ? spotOf(m) : 0, value, pnl: value - spent, pct: spent ? (value - spent) / spent * 100 : 0 };
+  }).sort((a, b) => a.id.localeCompare(b.id)); // stable order: rows never move as prices tick
+  const totalPnl = posRows.reduce((s2, r) => s2 + r.pnl, 0);
+  const totalPosValue = posRows.reduce((s2, r) => s2 + r.value, 0);
+  const poolNav = poolNavOf(totalPosValue);
+  const myLpValue = poolShares > 0 ? lp.shares * poolNav / poolShares : 0;
+  const myPoolPct = poolShares > 0 ? lp.shares / poolShares * 100 : 0;
+  // Pool PnL = worth now minus net cash put in (deposits - withdrawals).
+  const lpPnl = myLpValue - lp.deposited;
+  const lpPnlPct = lp.deposited > 0 ? lpPnl / lp.deposited * 100 : 0;
   const connect = () => {
     if (modal) { modal.show(); return; }
     flash(CONFIG.networkId === 'sandbox'
@@ -319,7 +365,9 @@ export default function App() {
   const exec = async () => {
     if (!(amt > 0) || tooOld || busy) return;
     if (buy && amt > balance && !live) { flash(`Insufficient paper USDC — balance ${fmt$(balance, 0)}`); return; }
-    if (!buy && !canSell && !live) { flash(`Not enough s${sel.sym} — you hold ${myBal.toFixed(1)}`); return; }
+    if (!buy && myBal <= 0.001 && !live) { flash(`No ${sel.pair} position to sell`); return; }
+    // Dollar-denominated sells cap at units actually held (bid moves continuously;
+    // asking for $X at a decayed bid must mean "sell all", not "blocked").
     if (live) {
       setBusy(true);
       try {
@@ -329,7 +377,9 @@ export default function App() {
           await sendFtTransferCall(selector, Math.round(amt * 1e6), { action: 'buy', market_id: sel.id, max_price_usdc_minor: String(Number.MAX_SAFE_INTEGER), ...bundleArgs });
           flash(`On-chain BUY submitted · ${sel.pair} ${fmt$(amt, 0)} — check On-chain panel`);
         } else {
-          const unitsMinor = Math.round(receive * 1e6);
+          const chainUnits = Number(chain?.position) / 1e6;
+          const sellUnits = Number.isFinite(chainUnits) && chainUnits > 0 ? Math.min(receive, chainUnits) : receive;
+          const unitsMinor = Math.round(sellUnits * 1e6);
           await callMethod(selector, 'sell', { market_id: sel.id, units_minor: String(unitsMinor), min_price_usdc_minor: '0', ...bundleArgs });
           flash(`On-chain SELL submitted · payout lands in claimable — use Claim`);
         }
@@ -339,13 +389,28 @@ export default function App() {
       } finally { setBusy(false); }
       return;
     }
-    // PAPER path: local simulation only, explicitly labelled.
-    const units = receive;
-    setBalance(bal => buy ? bal - amt : bal + amt);
+    // PAPER path: one consistent ledger vs the pool (mirrors the core).
+    let units = receive;
+    let payout = 0;
+    if (buy) {
+      const reserveAfter = totalReserved + units * sel.base * FORMULA.cap;
+      if (poolCash + amt < reserveAfter) { flash(`Pool cannot cover this trade — reserve ${fmt$(reserveAfter, 0)} > pool ${fmt$(poolCash + amt, 0)}`); return; }
+      setBalance(bal => bal - amt);
+      setPoolCash(c => c + amt);
+    } else {
+      units = Math.min(units, myBal);
+      if (units >= myBal * 0.999) units = myBal; // sell-all leaves no dust
+      payout = Math.min(units * q.bid, units * sel.base * FORMULA.cap, poolCash);
+      setBalance(bal => bal + payout);
+      setPoolCash(c => c - payout);
+    }
+    setCost(c => buy
+      ? { ...c, [sel.id]: (c[sel.id] || 0) + amt }
+      : { ...c, [sel.id]: Math.max(0, (c[sel.id] || 0) * (myBal ? 1 - units / myBal : 0)) });
     setHoldings(h => ({ ...h, [sel.id]: Math.max(0, (h[sel.id] || 0) + (buy ? units : -units)) }));
     setMarkets(prev => prev.map(m => m.id === selId ? { ...m, minted: Math.max(0, m.minted + (buy ? Math.round(units) : -Math.round(units))), vol24: m.vol24 + amt } : m));
-    setFills(f => [{ id: Date.now(), side: buy ? 'BUY' : 'SELL', tok: sel.pair, units, usdc: amt, px, t: Date.now(), paper: true }, ...f].slice(0, 7));
-    flash(buy ? `PAPER +${units.toFixed(1)} units ${sel.pair} · ${fmt$(amt, 0)} @ ${fmt$(px)} (simulated)` : `PAPER closed ${units.toFixed(1)} units ${sel.pair} (simulated)`);
+    setFills(f => [{ id: Date.now(), side: buy ? 'BUY' : 'SELL', tok: sel.pair, units, usdc: buy ? amt : payout, px, level: spot * px / Math.max(q.fair, 0.01), t: Date.now(), paper: true }, ...f].slice(0, 7));
+    flash(buy ? `PAPER bought ${fmt$(amt, 0)} of ${sel.pair} @ ${fmtFx(spot * px / Math.max(q.fair, 0.01))}` : `PAPER sold for ${fmt$(payout, 0)}`);
   };
   const claimNow = async () => {
     if (!live || busy) return;
@@ -353,6 +418,39 @@ export default function App() {
     try { await callMethod(selector, 'claim', {}); flash('Claim submitted — USDC transfer pending'); setTimeout(refreshChain, 3000); }
     catch (e) { flash(`Claim failed: ${String(e?.message || e).slice(0, 140)}`); }
     finally { setBusy(false); }
+  };
+
+  const poolMove = async (deposit) => {
+    const a = parseFloat(poolAmt) || 0;
+    if (!(a > 0) || busy) return;
+    if (live) {
+      setBusy(true);
+      try {
+        if (deposit) { await sendFtTransferCall(selector, Math.round(a * 1e6), { action: 'deposit_lp' }); flash(`Pool deposit submitted · ${fmt$(a, 0)}`); }
+        else { await callMethod(selector, 'withdraw_lp', { shares: String(Math.round(a * 1e6)) }); flash('Pool withdrawal credited — use Claim in On-chain panel'); }
+        setTimeout(refreshChain, 2500);
+      } catch (e) { flash(`Pool transaction failed: ${String(e?.message || e).slice(0, 140)}`); }
+      finally { setBusy(false); }
+      return;
+    }
+    if (deposit) {
+      if (a > balance) { flash(`Insufficient paper USDC — balance ${fmt$(balance, 0)}`); return; }
+      if (poolNav <= 0 && poolShares > 0) { flash('Pool has no value left to price new shares'); return; }
+      const minted = poolShares === 0 ? a : a * poolShares / poolNav;
+      setBalance(b => b - a); setPoolCash(c => c + a); setPoolShares(t => t + minted);
+      setLp(x => ({ deposited: x.deposited + a, shares: x.shares + minted }));
+      flash(`PAPER deposited ${fmt$(a, 0)} → ${minted.toFixed(1)} pool shares`);
+    } else {
+      if (!(lp.shares > 0)) { flash('Nothing deposited in the pool yet'); return; }
+      const free = Math.max(0, poolCash - totalReserved);
+      const wantShares = poolNav > 0 ? Math.min(lp.shares, a * poolShares / poolNav) : 0;
+      const out = Math.min(poolShares > 0 ? wantShares * poolNav / poolShares : 0, free);
+      if (!(out > 0)) { flash(`Pool cash is reserved against open positions — free now: ${fmt$(free, 0)}`); return; }
+      const burned = poolNav > 0 ? out * poolShares / poolNav : wantShares;
+      setBalance(b => b + out); setPoolCash(c => c - out); setPoolShares(t => t - burned);
+      setLp(x => ({ deposited: Math.max(0, x.deposited - out), shares: Math.max(0, x.shares - burned) }));
+      flash(`PAPER withdrew ${fmt$(out, 0)} from the pool${out < a ? ` (asked ${fmt$(a, 0)}; rest is reserved)` : ''}`);
+    }
   };
 
   async function launchMarket() {
@@ -405,19 +503,14 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="tape" aria-hidden="true">
-        <div className="tape-track">
-          {[...gainers, ...gainers].map((m, i) => {
-            const c = (m.price - m.prev) / m.prev * 100;
-            return <span key={i} className="tape-item"><b>{m.pair}</b> {fmtFx(spotOf(m))} <i className={c >= 0 ? 'up' : 'down'}>{c >= 0 ? '▲' : '▼'} {Math.abs(c).toFixed(1)}%</i></span>;
-          })}
-        </div>
-      </div>
-
       <header className="topbar">
         <div className="brand-wrap"><div className="logo">ZT</div><div className="brand">Zero<em>Tick</em></div><span className="live-dot" /></div>
-        <div className="vault-pill" title="One shared USDC vault backs every internal position">
-          SHARED VAULT <b>{fmtK(vaultColl)}</b><span className="sep" />COVERAGE <b className={coverage >= 1 ? 'ok' : 'bad'}>{coverage.toFixed(2)}×</b>
+        <div className="screen-tabs" role="tablist" aria-label="Main screens" style={{ margin: '0 auto' }}>
+          <button className={`screen-tab ${tab === 'trade' ? 'active' : ''}`} role="tab" aria-selected={tab === 'trade'} onClick={() => setTab('trade')}>Trade</button>
+          <button className={`screen-tab ${tab === 'earn' ? 'active' : ''}`} role="tab" aria-selected={tab === 'earn'} onClick={() => setTab('earn')}>Earn</button>
+        </div>
+        <div className="vault-pill" title="Cash is shared. Trade and Pool each track their own PnL on their screen.">
+          CASH <b>{fmt$(balance, 0)}</b><span className="sep" />POSITIONS <b>{fmt$(totalPosValue)}</b><span className="sep" />POOL <b>{fmt$(myLpValue)}</b>
         </div>
         <div className="top-actions">
           {account
@@ -429,18 +522,10 @@ export default function App() {
       <div className="paper-banner" role="note">
         {live
           ? <>● LIVE MODE — trades submit real transactions on {CONFIG.networkId}. Market data below is still the local paper tape until the oracle feed is wired per market.</>
-          : <>● PAPER TRADING — prices, balances and fills are simulated locally. Nothing here moves real funds. The “On-chain” panel shows real contract state via RPC. Not investment advice; synthetic positions can lose their full value.</>}
+          : <>● PAPER — simulated money, saved in your browser. Real contract state is in the On-chain box.</>}
       </div>
 
-      <div className="kpi-strip">
-        <div className="kpi"><span>Synthetic markets</span><b>{markets.length}</b></div>
-        <div className="kpi"><span>Shared vault</span><b>{fmtK(vaultColl)}</b></div>
-        <div className="kpi"><span>Max liability covered</span><b>{coverage.toFixed(2)}×</b></div>
-        <div className="kpi"><span>24h volume</span><b>{fmtK(totalVol)}</b></div>
-        <div className="kpi"><span>Open units</span><b>{markets.reduce((s, m) => s + m.minted, 0).toLocaleString()}</b></div>
-        <div className="kpi accent"><span>Quote update txs</span><b>0</b></div>
-      </div>
-
+      {tab === 'trade' && (
       <main className="terminal">
         {/* left rail */}
         <aside className="rail">
@@ -461,12 +546,6 @@ export default function App() {
                 ))}
               </div>
             )}
-          </div>
-          <div className="rail-controls">
-            <div className="cat-pills">{CATS.map(c => <button key={c} className={`cat ${cat === c ? 'active' : ''}`} onClick={() => setCat(c)}>{c !== 'All' && <i className="cat-dot" style={{ background: CAT_COLOR[c] }} />}{c} <em>{c === 'All' ? markets.length : markets.filter(m => m.cat === c).length}</em></button>)}</div>
-            <select className="sort" value={sort} onChange={e => setSort(e.target.value)}>
-              <option value="gainers">↑ Gainers</option><option value="losers">↓ Losers</option><option value="vol">Volume</option><option value="tvl">TVL</option><option value="az">A–Z</option>
-            </select>
           </div>
           <div className="rail-count">{filtered.length} markets</div>
           <div className="rail-list">
@@ -504,60 +583,31 @@ export default function App() {
           </div>
           <div className="chart-wrap"><CandleChart candles={spotCandles} height={300} onHover={setHoverCandle} /></div>
 
-          <div className="center-split">
-            <div className="card">
-              <div className="card-title">Oracle bundle <span className={`age-badge ${ageSecs <= 1 ? 'fresh' : ageSecs <= 4 ? 'warm' : 'stale'}`}>{ageSecs <= 1 ? '● BEST PRICE' : ageSecs <= 4 ? '● DECAYING' : '● STALE'} {ageSecs.toFixed(1)}s</span></div>
-              <div className="bundle-grid">
-                <div><span>Level</span><b>{spot.toLocaleString(undefined, { maximumFractionDigits: spot < 1 ? 4 : 1 })}</b></div>
-                <div><span>Deviation 1m</span><b>{sel.dev} bps</b></div>
-                <div><span>Sequence</span><b>#{seq}</b></div>
-                <div><span>Signer</span><b>oracle.near ✓</b></div>
-              </div>
-              <div className="age-bar"><div style={{ width: `${Math.min(100, ageSecs / FORMULA.maxAge * 100)}%`, background: ageSecs <= 1 ? 'var(--green)' : ageSecs <= 4 ? 'var(--amber)' : 'var(--red)' }} /></div>
-              <div className="checks">
-                <span>✓ signature</span><span>✓ signer</span><span className={ageSecs > FORMULA.maxAge ? 'bad' : ''}>{ageSecs > FORMULA.maxAge ? '✗' : '✓'} fresh ≤{FORMULA.maxAge}s</span><span>✓ sequence</span><span className={sel.dev > 500 ? 'bad' : ''}>{sel.dev > 500 ? '✗' : '✓'} deviation</span>
-              </div>
-              <div className="spread-break">
-                <span>Spread {Math.round(q.half * 2)} bps =</span>
-                <i style={{ flex: FORMULA.baseBps, background: '#3d4a55' }} title="base" /><i style={{ flex: Math.max(1, q.stale), background: 'var(--amber)' }} title="staleness" /><i style={{ flex: Math.max(1, q.vol), background: '#4d7cff' }} title="vol" /><i style={{ flex: Math.max(1, q.skewBps), background: 'var(--lime)' }} title="skew" />
-              </div>
-              <div className="spread-legend"><span>base {FORMULA.baseBps}</span><span className="amber">age +{q.stale.toFixed(0)}</span><span className="blue">vol +{q.vol.toFixed(0)}</span><span className="lime">skew +{q.skewBps.toFixed(0)}</span></div>
-              <button className="btn push" onClick={pushOracleNow}>⟳ New bundle — reset age</button>
-            </div>
+          <div className="hint" style={{ margin: '8px 2px' }}>Price {ageSecs.toFixed(1)}s old · spread {Math.round(q.half * 2)} bps{q.skewBps > 1 ? ` (incl. +${Math.round(q.skewBps)} liquidity — pool ${(poolUtilNow * 100).toFixed(0)}% reserved)` : ''} · Pool {fmtK(vaultColl)}</div>
 
-            <div className="card">
-              <div className="card-title">Shared vault · this market</div>
-              <div className="kv"><span>Vault collateral (all pairs)</span><b>{fmtK(vaultColl)}</b></div>
-              <div className="kv"><span>Open units</span><b>{sel.minted.toLocaleString()}</b></div>
-              <div className="kv"><span>Value owed now</span><b>{fmtK(liab)}</b></div>
-              <div className="kv"><span>Stress reserve (2×)</span><b>{fmtK(maxLiab)}</b></div>
-              <div className="kv"><span>Backing / unit</span><b>${backing.toFixed(2)}</b></div>
-              <div style={{ marginTop: 8 }}><VaultDonut collateral={sel.coll * 1e6} exposure={liab * 1e6} /></div>
-              <div style={{ marginTop: 10 }}><Bar pct={maxLiab / (sel.base * 2 * 10000) * 100} /><div className="hint">Per-market stress reserve {fmtK(maxLiab)} — one pair cannot drain the shared vault.</div></div>
-            </div>
-          </div>
-
-          {sel.odds ? (
+          {sel.odds && (
           <div className="card payoff">
             <div className="card-title">Resolution {sel.maturity} <span className="right">official result sends 1 or 0</span></div>
             <div className="yesno">
               <div className="yn yes"><span>YES · {(q.fair / sel.base * 100).toFixed(0)}% implied</span><b>$10.00 / unit</b><small>your {receive ? receive.toFixed(1) : '0'} units → {fmt$(receive * sel.base)} ({receive * sel.base - amt >= 0 ? '+' : ''}{fmt$(receive * sel.base - amt, 0)})</small></div>
               <div className="yn no"><span>NO · {(100 - q.fair / sel.base * 100).toFixed(0)}%</span><b>$0.00 / unit</b><small>your {receive ? receive.toFixed(1) : '0'} units → $0 (−{fmt$(amt, 0)})</small></div>
             </div>
-            <div className="hint">Price from the {sel.source.split(' · ')[0]} book (its $1 share price is the probability). Payout here is on a $10 unit. Settlement follows the official result, not the last traded price. No funding, no leverage.</div>
-          </div>
-          ) : (
-          <div className="card payoff">
-            <div className="card-title">If the price moves <span className="right">1× · no funding · sell anytime at bid</span></div>
-            <input type="range" aria-label="Simulated price move percent" min="-60" max="160" step="5" value={simRet} onChange={e => setSimRet(+e.target.value)} className="slider" />
-            <div className="payoff-row">
-              <span>Price <b className={simRet >= 0 ? 'up' : 'down'}>{simRet >= 0 ? '+' : ''}{simRet}%</b> → <b>{fmtFx(spot * (1 + simRet / 100))}</b></span>
-              <span>Your {fmt$(amt, 0)} position → <b className={simRet >= 0 ? 'up' : 'down'}>{fmt$(amt * (1 + simRet / 100))} ({simRet >= 0 ? '+' : ''}{fmt$(amt * simRet / 100, 0)})</b></span>
-            </div>
-            <div className="payoff-bar"><div style={{ width: `${Math.min(100, Math.max(0, (1 + simRet / 100) / 2.6 * 100))}%` }} /></div>
-            <div className="hint">Synthetic spot: fully funded 1×, no funding payments, no liquidation, no expiry. The vault reserves at a 2× stress move so closes stay solvent. Debt is out of scope (coupons).</div>
+            <div className="hint">Settles on the official result: YES pays $10/unit, NO pays $0.</div>
           </div>
           )}
+
+          {/* Positions: always rendered, same place, stable order — for every market type. */}
+          <div className="card payoff" data-testid="positions-panel">
+            <div className="card-title">Your positions {posRows.length > 0 && <span className="right">total {fmt$(totalPosValue)} · <b className={totalPnl >= 0 ? 'up' : 'down'}>{totalPnl >= 0 ? '+' : '−'}{fmt$(Math.abs(totalPnl))}</b></span>}</div>
+            {posRows.length === 0
+              ? <div className="hint">None yet. Buy something on the right — it shows up here with its profit/loss.</div>
+              : posRows.map(r => (
+                <button key={r.id} className="feed-row pos-row" onClick={() => { pick(r.id); setBuy(false); }} title="Select to sell">
+                  <span><b>{r.m ? r.m.pair : r.id}</b> <small>spent {fmt$(r.spent, 0)} @ {fmtFx(r.entryLevel)} · now {fmtFx(r.nowLevel)}</small></span>
+                  <b className={r.pnl >= 0 ? 'up' : 'down'}>{fmt$(r.value)} ({r.pnl >= 0 ? '+' : '−'}{fmt$(Math.abs(r.pnl))}, {r.pct >= 0 ? '+' : ''}{r.pct.toFixed(1)}%)</b>
+                </button>))}
+            <div className="hint">Click a position to sell it. Paper positions are saved in your browser.</div>
+          </div>
         </section>
 
         {/* right ticket */}
@@ -569,38 +619,16 @@ export default function App() {
           <div className="bal-row"><span>{live ? 'Paper reference balance' : 'Paper USDC balance'}</span><b>${balance.toLocaleString()}</b></div>
           <label className="flabel" htmlFor="amt-input">Amount · USDC</label>
           <div className="amount-box"><input id="amt-input" type="number" min="1" value={size} onChange={e => setSize(e.target.value)} /><span>USDC</span></div>
-          <div className="quick">{[25, 50, 75, 100].map(p => <button key={p} onClick={() => setSize(String(Math.round(balance * p / 100)))}>{p === 100 ? 'MAX' : p + '%'}</button>)}</div>
+          <div className="quick">{[25, 50, 75, 100].map(p => <button key={p} onClick={() => setSize(String(Math.round((buy ? balance : Math.min(myBal * q.bid, myBal * sel.base * FORMULA.cap)) * p / 100)))}>{p === 100 ? 'MAX' : p + '%'}</button>)}</div>
           <div className="receive">
-            <span>You {buy ? 'receive' : 'send'}</span>
-            <b>{fmt$(amt, 0)} <em>notional · {sel.pair}</em></b>
-            <small>@ {fmtFx(spot * px / Math.max(q.fair, 0.01))}{sel.odds ? ` · odds ${(sel.base / Math.max(px, 0.01)).toFixed(2)}x` : sel.pair.includes('/') ? ` · ≈ ${(amt * spot).toLocaleString(undefined, { maximumFractionDigits: 0 })} ${sel.pair.split('/')[1]} exposure` : ''} · age {ageSecs.toFixed(1)}s</small>
+            <span>{buy ? 'You get' : 'You sell'}</span>
+            <b>{fmt$(amt, 0)} <em>of {sel.pair}</em></b>
+            <small>at {fmtFx(spot * px / Math.max(q.fair, 0.01))}{sel.odds ? ` · if YES pays ${fmt$(receive * sel.base, 0)}` : ''}</small>
           </div>
           <button className={`cta ${buy ? 'cta-buy' : 'cta-sell'}`} onClick={exec} disabled={tooOld || busy}>
             {busy ? 'SUBMITTING…' : tooOld ? 'ORACLE STALE — WAITING' : <>{buy ? '▲ BUY' : '▼ SELL'} {sel.pair} @ {fmtFx(spot * px / Math.max(q.fair, 0.01))}<small>{fmt$(amt, 0)} USDC · {live ? 'on-chain via USDC transfer' : 'paper simulation'}</small></>}
           </button>
-          <div className="ticket-rows">
-            <div className="kv"><span>Reserve locked (max)</span><b>{fmt$(receive * maxPay, 0)}</b></div>
-            <div className="kv"><span>Vault coverage after</span><b>{coverage.toFixed(2)}×</b></div>
-            <div className="kv"><span>Exit</span><b>anytime at bid</b></div>
-          </div>
-          <button className="adv" onClick={() => setShowAdv(a => !a)}>{showAdv ? '▾' : '▸'} Formula params · {sel.odds ? 'BinaryV1' : 'SyntheticSpotV1'}</button>
-          {showAdv && (
-            <div className="adv-body">
-              <label>Base spread bps<input type="number" value={pol.base_spread_bps} onChange={e => setPol(p => ({ ...p, base_spread_bps: parseInt(e.target.value || '0') }))} /></label>
-              <label>Skew bps<input type="number" value={pol.inventory_skew_bps} onChange={e => setPol(p => ({ ...p, inventory_skew_bps: parseInt(e.target.value || '0') }))} /></label>
-              <div className="hint">Staleness +{FORMULA.staleBpsPerSec} bps/s · vol = dev÷{FORMULA.volDivisor} · hard reject &gt;{FORMULA.maxAge}s. Formulas are open — this market uses one audited kind; new kinds deploy behind the same vault.</div>
-            </div>
-          )}
-          <div className="holdings">
-            <div className="card-title">Your positions</div>
-            {Object.entries(holdings).filter(([, v]) => v > 0.001).length === 0
-              ? <div className="hint">None yet — your first buy lands here.</div>
-              : Object.entries(holdings).filter(([, v]) => v > 0.001).map(([id, v]) => {
-                  const m = markets.find(x => x.id === id);
-                  return <div key={id} className="feed-row"><span><b>{m ? m.pair : id}</b></span><b>{v.toFixed(1)} · ${m ? (v * m.price).toFixed(0) : '—'}</b></div>;
-                })}
-          </div>
-          {fills.length > 0 && <div className="holdings"><div className="card-title">Recent fills {fills[0]?.paper ? '(paper)' : ''}</div>{fills.map(f => <div key={f.id} className="feed-row"><span className={f.side === 'BUY' ? 'up' : 'down'}>{f.side} {f.tok}</span><b>{fmt$(f.usdc, 0)} @ {fmt$(f.px)}</b></div>)}</div>}
+          {fills.length > 0 && <div className="holdings"><div className="card-title">Recent trades</div>{fills.map(f => <div key={f.id} className="feed-row"><span className={f.side === 'BUY' ? 'up' : 'down'}>{f.side} {f.tok}</span><b>{fmt$(f.usdc, 0)} @ {fmtFx(f.level || 0)}</b></div>)}</div>}
           <div className="holdings">
             <div className="card-title">On-chain · {CONFIG.networkId}</div>
             {chain?.err
@@ -619,16 +647,52 @@ export default function App() {
           </div>
         </aside>
       </main>
+      )}
 
-      <div className="movers">
-        <div className="movers-head">🔥 Top movers — synthetic, listed nowhere else</div>
-        <div className="movers-track">
-          {gainers.slice(0, 8).map(m => {
-            const c = (m.price - m.prev) / m.prev * 100;
-            return <button key={m.id} className="mover" onClick={() => pick(m.id)}><b>{m.pair}</b><span>{m.name}</span><strong className={c >= 0 ? 'up' : 'down'}>{c >= 0 ? '▲ +' : '▼ '}{c.toFixed(1)}%</strong><em>{fmtFx(spotOf(m))} · vol {fmtK(m.vol24)}</em></button>;
-          })}
+      {tab === 'earn' && (
+      <main className="earn-wrap">
+        <div className="earn-stats">
+          <div className="earn-stat"><span>Pool cash</span><b>{live && chain?.vault ? fmt$((Number(chain.vault.collateral) || 0) / 1e6, 0) : fmt$(poolCash, 0)}</b><small>pays every trade on every market</small></div>
+          <div className="earn-stat"><span>Yours is worth</span><b>{live ? '—' : fmt$(myLpValue)}</b><small>{live ? 'settles on-chain at withdrawal' : `put in ${fmt$(lp.deposited, 0)} · ${myPoolPct.toFixed(2)}% of pool`}</small></div>
+          <div className="earn-stat"><span>Pool PnL</span><b className={lpPnl >= 0 ? 'up' : 'down'}>{live ? '—' : `${lpPnl >= 0 ? '+' : '−'}${fmt$(Math.abs(lpPnl))}`}</b><small>{live ? 'see withdrawal value on-chain' : `${lpPnlPct >= 0 ? '+' : ''}${lpPnlPct.toFixed(1)}% on your deposit`}</small></div>
         </div>
-      </div>
+
+        <div className="earn-grid">
+          <div className="card">
+            <div className="pool-modes" role="group" aria-label="Pool action">
+              <button className={`tab ${poolMode === 'deposit' ? 'active' : ''}`} onClick={() => setPoolMode('deposit')}>Deposit</button>
+              <button className={`tab ${poolMode === 'withdraw' ? 'active' : ''}`} onClick={() => setPoolMode('withdraw')}>Withdraw</button>
+            </div>
+            <label className="flabel" htmlFor="pool-amt" style={{ marginTop: 12 }}>Amount · USDC</label>
+            <div className="amount-box"><input id="pool-amt" type="number" min="1" value={poolAmt} onChange={e => setPoolAmt(e.target.value)} /><span>USDC</span></div>
+            <div className="quick" style={{ marginTop: 8 }}>
+              {[25, 50, 75, 100].map(pct => <button key={pct} onClick={() => setPoolAmt(String(Math.round((poolMode === 'deposit' ? balance : myLpValue) * pct / 100)))}>{pct === 100 ? 'MAX' : pct + '%'}</button>)}
+            </div>
+            <button className="cta cta-buy" style={{ marginTop: 14 }} onClick={() => poolMove(poolMode === 'deposit')} disabled={busy || !(parseFloat(poolAmt) > 0)}>
+              {busy ? 'SUBMITTING…' : <>{poolMode === 'deposit' ? 'Deposit' : 'Withdraw'} {fmt$(parseFloat(poolAmt) || 0, 0)}<small>{poolMode === 'deposit' ? `cash ${fmt$(balance, 0)} available` : `free to withdraw ${fmt$(Math.max(0, poolCash - totalReserved), 0)}`}</small></>}
+            </button>
+            <div className="hint" style={{ marginTop: 10 }}>Withdrawals pay only from free cash — money reserved against open positions stays until those positions close.</div>
+            {!live && lp.shares > 0 && posRows.length > 0 && (
+              <div className="hint" style={{ marginTop: 6 }}>Heads up: you own {myPoolPct.toFixed(2)}% of this pool <em>and</em> trade against it — part of your trading profit is paid by your own deposit. Judge the two PnLs together, not separately.</div>
+            )}
+          </div>
+
+          <div>
+            <div className="card">
+              <div className="card-title">Pool details</div>
+              <div className="kv" style={{ marginTop: 6 }}><span>Reserved for open positions</span><b>{live && chain?.vault ? fmt$((Number(chain.vault.reserved_max) || 0) / 1e6) : fmt$(totalReserved)}</b></div>
+              <div className="kv"><span>Free to withdraw</span><b>{live && chain?.vault ? fmt$((Number(chain.vault.free) || 0) / 1e6) : fmt$(Math.max(0, poolCash - totalReserved))}</b></div>
+              <div className="kv"><span>Your cash (shared with trading)</span><b>{fmt$(balance, 0)}</b></div>
+              {!live && <div className="kv"><span>Your shares</span><b>{lp.shares.toFixed(1)}</b></div>}
+            </div>
+            <div className="card" style={{ marginTop: 12 }}>
+              <div className="card-title">How you make / lose money here</div>
+              <div className="hint">1. Every trade pays a spread into the pool — that's income.<br/>2. When traders win, the pool pays them — that's the loss.<br/>3. Each payout is capped at its reserved maximum, so one trade can't empty the pool.</div>
+            </div>
+          </div>
+        </div>
+      </main>
+      )}
 
       <footer className="footer"><span>{live ? 'Live' : 'Paper'} · shared vault · sells capped at reserved max · signed oracle bundles</span><span>{CONFIG.contractId} · {CONFIG.networkId}</span></footer>
       {showCreate && (
